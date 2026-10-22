@@ -1,0 +1,7 @@
+{
+    "port-config": {
+        "protocol-file": "BeszelAIO.sc"
+    },
+    "systemd-unit": {
+    }
+}

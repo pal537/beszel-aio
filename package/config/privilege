@@ -1,0 +1,7 @@
+{
+    "defaults": {
+        "run-as": "root"
+    },
+    "username": "beszel-aio",
+    "groupname": "beszel-aio"
+}

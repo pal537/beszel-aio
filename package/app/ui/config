@@ -1,0 +1,14 @@
+{
+    ".url": {
+        "beszel-aio.Application": {
+            "title": "Beszel 系统监控",
+            "desc": "轻量级服务器监控 · 开箱即用",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "https",
+            "port": "18092",
+            "url": "/",
+            "allUsers": true
+        }
+    }
+}

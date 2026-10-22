@@ -1,0 +1,4 @@
+.dl/
+package/app/bin/*
+!package/app/bin/.gitkeep
+*.fpk

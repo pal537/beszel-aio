@@ -1,0 +1,16 @@
+appname               = beszel-aio
+version               = 0.21.0
+display_name          = Beszel 系统监控
+desc                  = 轻量级服务器监控(Beszel 官方原版移植): CPU、内存、磁盘、网络、温度与 Docker 容器历史曲线和阈值告警。本移植版开箱即用: 安装后自动完成本机监控配对, 打开即用, 免注册免登录; 告警、通知、多机管理等全部设置与原版一致保留。数据仅存本机。
+platform              = x86
+source                = thirdparty
+maintainer            = henrygd
+maintainer_url        = https://github.com/henrygd/beszel
+distributor           = stingeo
+distributor_url       = https://github.com/pal537/beszel-aio
+desktop_uidir         = ui
+desktop_applaunchname = beszel-aio.Application
+service_port          = 18092
+checkport             = true
+ctl_stop              = true
+micro_app             = true
