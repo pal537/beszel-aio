@@ -491,6 +491,28 @@ func rewriteBody(b []byte, ct string) []byte {
 	return []byte(s)
 }
 
+// stripAppPrefix 剥掉飞牛同源网关前缀; 无尾斜杠的入口请求先重定向到
+// 带斜杠形式, 保证相对路径解析正确。
+func stripAppPrefix(pfx string, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == pfx {
+			http.Redirect(w, r, pfx+"/", http.StatusFound)
+			return
+		}
+		if strings.HasPrefix(p, pfx+"/") {
+			r2 := new(http.Request)
+			*r2 = *r
+			u := *r.URL
+			u.Path = p[len(pfx):]
+			r2.URL = &u
+			h.ServeHTTP(w, r2)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
 var shutdownCh = make(chan struct{})
 
 func bootstrap() {
@@ -760,7 +782,10 @@ func main() {
 	if sockPath != "" {
 		// fnOS 同源网关模式: 监听应用目录的 unix socket, 飞牛桌面经
 		// /app/beszel-aio 前缀转发进来, TLS 由飞牛桌面终结,
-		// 家里/外网/APP 远程都跟着桌面走, 不再依赖独立端口
+		// 家里/外网/APP 远程都跟着桌面走, 不再依赖独立端口。
+		// 注意: 网关把完整路径原样转给应用, 前缀要应用自己剥
+		// (飞牛原生应用同款做法), 出方向再由正文改写补回。
+		srv.Handler = stripAppPrefix(prefix, mux)
 		_ = os.Remove(sockPath)
 		ln, err := net.Listen("unix", sockPath)
 		if err != nil {
