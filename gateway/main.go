@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -34,6 +35,8 @@ var (
 	dataDir  string
 	appDir   string
 	port     string
+	sockPath string
+	prefix   string
 	state    *State
 	stateMu  sync.Mutex
 	ready    bool
@@ -449,6 +452,45 @@ func getCertificate(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return certCache, nil
 }
 
+// ---------- 同源网关模式(/app/beszel-aio 前缀)正文改写 ----------
+// hub(PocketBase + Beszel 前端)按根路径写死了 /assets /static /api /_ 等
+// 绝对路径, 挂到飞牛桌面 /app/<app> 前缀下时浏览器会把这些路径解析到桌面
+// 根目录而 404。网关在转发时给这些字面量补上前缀; hub 本体不改。
+// SSE(text/event-stream)与二进制内容不在改写之列。
+
+func rewritableType(ct string) bool {
+	ct = strings.ToLower(ct)
+	for _, t := range []string{"text/html", "text/css", "javascript", "application/json", "manifest+json", "image/svg+xml"} {
+		if strings.Contains(ct, t) {
+			return true
+		}
+	}
+	return false
+}
+
+var rewriteRoots = []string{"/assets/", "/static/", "/api/", "/_/"}
+
+func rewriteBody(b []byte, ct string) []byte {
+	s := string(b)
+	for _, root := range rewriteRoots {
+		for _, lead := range []string{"\"", "'", "`", "("} {
+			s = strings.ReplaceAll(s, lead+root, lead+prefix+root)
+		}
+	}
+	if strings.Contains(ct, "text/html") {
+		// SPA 路由用的 pushState/replaceState 与站内链接若写根路径会跳出前缀,
+		// 注入一小段守卫脚本把根路径自动补上前缀
+		guard := `<script>(function(){var P="` + prefix + `";function fix(u){if(typeof u==="string"&&u.charAt(0)==="/"&&u.charAt(1)!=="/"&&u!==P&&u.indexOf(P+"/")!==0){return P+u}return u}var ps=history.pushState,rs=history.replaceState;history.pushState=function(a,b,u){return ps.call(this,a,b,fix(u))};history.replaceState=function(a,b,u){return rs.call(this,a,b,fix(u))};document.addEventListener("click",function(e){var t=e.target;if(t&&t.closest){var a=t.closest("a");if(a){var h=a.getAttribute("href");if(h&&h.charAt(0)==="/"&&h.charAt(1)!=="/"){a.setAttribute("href",fix(h))}}}},true);})();</script>`
+		low := strings.ToLower(s)
+		if i := strings.Index(low, "<head"); i >= 0 {
+			if j := strings.Index(low[i:], ">"); j >= 0 {
+				s = s[:i+j+1] + guard + s[i+j+1:]
+			}
+		}
+	}
+	return []byte(s)
+}
+
 var shutdownCh = make(chan struct{})
 
 func bootstrap() {
@@ -547,15 +589,15 @@ const landingHTML = `<!DOCTYPE html>
 <script>
 (async () => {
   try {
-    const r = await fetch('/_gw/login');
+    const r = await fetch('__P__/_gw/login');
     if (r.ok) {
       const d = await r.json();
       const auth = {token: d.token, record: d.record, model: d.record};
       localStorage.setItem('pocketbase_auth', JSON.stringify(auth));
     }
   } catch (e) {}
-  document.cookie = 'bzboot=1; path=/';
-  location.replace('/');
+  document.cookie = 'bzboot=1; path=__P__/';
+  location.replace('__P__/');
 })();
 </script></body></html>`
 
@@ -571,7 +613,7 @@ func settingsPage(w http.ResponseWriter, r *http.Request) {
 		state.AutoLogin = r.FormValue("autologin") == "on"
 		saveState(state)
 		stateMu.Unlock()
-		http.Redirect(w, r, "/_gw/settings?saved=1", http.StatusSeeOther)
+		http.Redirect(w, r, prefix+"/_gw/settings?saved=1", http.StatusSeeOther)
 		return
 	}
 	stateMu.Lock()
@@ -597,7 +639,7 @@ func settingsPage(w http.ResponseWriter, r *http.Request) {
 <p>关闭后，打开应用将使用 Beszel 原生登录页。本地账号如下，可直接登录，也可在面板里改密码或新建你自己的账号：</p>
 <div class="row">账号：<code>%s</code><br>密码：<code>%s</code></div>
 <button type="submit">保存</button></form>
-<hr><p><a href="/">← 返回监控面板</a></p></div></body></html>`, saved, checked, email, pass)
+<hr><p><a href="%s/">← 返回监控面板</a></p></div></body></html>`, saved, checked, email, pass, prefix)
 }
 
 func main() {
@@ -605,8 +647,13 @@ func main() {
 	dataDir = os.Getenv("BZ_DATA_DIR")
 	appDir = os.Getenv("BZ_APP_DIR")
 	port = os.Getenv("BZ_PORT")
-	if dataDir == "" || appDir == "" || port == "" {
-		log.Fatalf("BZ_DATA_DIR / BZ_APP_DIR / BZ_PORT required")
+	sockPath = os.Getenv("BZ_SOCK")
+	prefix = os.Getenv("BZ_PREFIX")
+	if dataDir == "" || appDir == "" || (port == "" && sockPath == "") {
+		log.Fatalf("BZ_DATA_DIR / BZ_APP_DIR / (BZ_PORT or BZ_SOCK) required")
+	}
+	if sockPath != "" && prefix == "" {
+		prefix = "/app/beszel-aio"
 	}
 	state = loadState()
 
@@ -619,6 +666,27 @@ func main() {
 		h := resp.Header
 		h.Del("X-Frame-Options")
 		h.Del("Cross-Origin-Opener-Policy")
+		if prefix != "" {
+			// 同源网关模式: 浏览器看到的地址带 /app/beszel-aio 前缀,
+			// hub 的绝对路径跳转要补上前缀, 否则跳出应用路径
+			if loc := h.Get("Location"); strings.HasPrefix(loc, "/") && !strings.HasPrefix(loc, "//") && !strings.HasPrefix(loc, prefix+"/") && loc != prefix {
+				h.Set("Location", prefix+loc)
+			}
+			ct := h.Get("Content-Type")
+			if h.Get("Content-Encoding") == "" && resp.ContentLength >= 0 && resp.ContentLength <= 16<<20 && rewritableType(ct) {
+				raw, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if err == nil {
+					nb := rewriteBody(raw, ct)
+					resp.Body = io.NopCloser(bytes.NewReader(nb))
+					resp.ContentLength = int64(len(nb))
+					h.Set("Content-Length", strconv.Itoa(len(nb)))
+					h.Del("ETag")
+				} else {
+					resp.Body = io.NopCloser(bytes.NewReader(raw))
+				}
+			}
+		}
 		if csp := h.Get("Content-Security-Policy"); strings.Contains(csp, "frame-ancestors") {
 			var keep []string
 			for _, d := range strings.Split(csp, ";") {
@@ -667,7 +735,7 @@ func main() {
 		if al && r.URL.Path == "/" {
 			if _, err := r.Cookie("bzboot"); err != nil {
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				_, _ = io.WriteString(w, landingHTML)
+				_, _ = io.WriteString(w, strings.ReplaceAll(landingHTML, "__P__", prefix))
 				return
 			}
 		}
@@ -676,7 +744,7 @@ func main() {
 
 	go bootstrap()
 
-	srv := &http.Server{Addr: ":" + port, Handler: mux}
+	srv := &http.Server{Handler: mux}
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
@@ -689,6 +757,23 @@ func main() {
 		stopProc(hb)
 		os.Exit(0)
 	}()
+	if sockPath != "" {
+		// fnOS 同源网关模式: 监听应用目录的 unix socket, 飞牛桌面经
+		// /app/beszel-aio 前缀转发进来, TLS 由飞牛桌面终结,
+		// 家里/外网/APP 远程都跟着桌面走, 不再依赖独立端口
+		_ = os.Remove(sockPath)
+		ln, err := net.Listen("unix", sockPath)
+		if err != nil {
+			log.Fatalf("listen sock: %v", err)
+		}
+		_ = os.Chmod(sockPath, 0660)
+		log.Printf("listening on unix socket %s (prefix %s)", sockPath, prefix)
+		if err := srv.Serve(ln); err != nil {
+			log.Fatalf("serve: %v", err)
+		}
+		return
+	}
+	srv.Addr = ":" + port
 	// 默认: 飞牛证书库里有可用证书就启用 HTTPS(飞牛桌面是 HTTPS,
 	// 窗口内嵌页同为 HTTPS 才不会被浏览器按混合内容拦截成白屏);
 	// 无证书时回退 HTTP(此时请用新标签页方式打开)。设 BZ_HTTPS=0 强制 HTTP。
