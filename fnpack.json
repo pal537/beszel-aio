@@ -37,6 +37,13 @@
               "download_url": "https://github.com/pal537/beszel-aio/releases/download/v0.21.2/beszel-aio-0.21.2-fnos.fpk"
             }
           }
+        },
+        "0.21.3": {
+          "packages": {
+            "x86": {
+              "download_url": "https://github.com/pal537/beszel-aio/releases/download/v0.21.3/beszel-aio-0.21.3-fnos.fpk"
+            }
+          }
         }
       },
       "run_as": "root"
