@@ -145,10 +145,30 @@ func waitHub() bool {
 	return false
 }
 
+// hubAppURL 返回传给 hub 的 APP_URL(官方子路径部署方式):
+// hub 据此算出 BASE_PATH 并自己改写 index.html 的相对资源路径、
+// 注入 globalThis.BESZEL, 前端路由与 PocketBase API 全链路对齐。
+// PocketBase 校验 APP_URL 必须是完整 URL(带 scheme+host, 纯路径会被拒),
+// 但实际起作用的只有路径部分; 主机部分只影响界面里展示的 Hub 链接。
+// 默认用 localhost 占位, 需要展示真实链接时用 BZ_APP_URL 覆盖为完整 URL。
+func hubAppURL() string {
+	if v := os.Getenv("BZ_APP_URL"); v != "" {
+		return v
+	}
+	if prefix != "" {
+		return "http://localhost" + prefix
+	}
+	return ""
+}
+
 func startHub() error {
 	procMu.Lock()
 	defer procMu.Unlock()
-	cmd, err := startProc("beszel", []string{"serve", "--http", fmt.Sprintf("127.0.0.1:%d", hubPort), "--dir", hubDataDir()}, dataDir, "hub.log")
+	var extraEnv []string
+	if u := hubAppURL(); u != "" {
+		extraEnv = append(extraEnv, "APP_URL="+u)
+	}
+	cmd, err := startProc("beszel", []string{"serve", "--http", fmt.Sprintf("127.0.0.1:%d", hubPort), "--dir", hubDataDir()}, dataDir, "hub.log", extraEnv...)
 	if err != nil {
 		return err
 	}
@@ -452,45 +472,6 @@ func getCertificate(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return certCache, nil
 }
 
-// ---------- 同源网关模式(/app/beszel-aio 前缀)正文改写 ----------
-// hub(PocketBase + Beszel 前端)按根路径写死了 /assets /static /api /_ 等
-// 绝对路径, 挂到飞牛桌面 /app/<app> 前缀下时浏览器会把这些路径解析到桌面
-// 根目录而 404。网关在转发时给这些字面量补上前缀; hub 本体不改。
-// SSE(text/event-stream)与二进制内容不在改写之列。
-
-func rewritableType(ct string) bool {
-	ct = strings.ToLower(ct)
-	for _, t := range []string{"text/html", "text/css", "javascript", "application/json", "manifest+json", "image/svg+xml"} {
-		if strings.Contains(ct, t) {
-			return true
-		}
-	}
-	return false
-}
-
-var rewriteRoots = []string{"/assets/", "/static/", "/api/", "/_/"}
-
-func rewriteBody(b []byte, ct string) []byte {
-	s := string(b)
-	for _, root := range rewriteRoots {
-		for _, lead := range []string{"\"", "'", "`", "("} {
-			s = strings.ReplaceAll(s, lead+root, lead+prefix+root)
-		}
-	}
-	if strings.Contains(ct, "text/html") {
-		// SPA 路由用的 pushState/replaceState 与站内链接若写根路径会跳出前缀,
-		// 注入一小段守卫脚本把根路径自动补上前缀
-		guard := `<script>(function(){var P="` + prefix + `";function fix(u){if(typeof u==="string"&&u.charAt(0)==="/"&&u.charAt(1)!=="/"&&u!==P&&u.indexOf(P+"/")!==0){return P+u}return u}var ps=history.pushState,rs=history.replaceState;history.pushState=function(a,b,u){return ps.call(this,a,b,fix(u))};history.replaceState=function(a,b,u){return rs.call(this,a,b,fix(u))};document.addEventListener("click",function(e){var t=e.target;if(t&&t.closest){var a=t.closest("a");if(a){var h=a.getAttribute("href");if(h&&h.charAt(0)==="/"&&h.charAt(1)!=="/"){a.setAttribute("href",fix(h))}}}},true);})();</script>`
-		low := strings.ToLower(s)
-		if i := strings.Index(low, "<head"); i >= 0 {
-			if j := strings.Index(low[i:], ">"); j >= 0 {
-				s = s[:i+j+1] + guard + s[i+j+1:]
-			}
-		}
-	}
-	return []byte(s)
-}
-
 // stripAppPrefix 剥掉飞牛同源网关前缀; 无尾斜杠的入口请求先重定向到
 // 带斜杠形式, 保证相对路径解析正确。
 func stripAppPrefix(pfx string, h http.Handler) http.Handler {
@@ -618,7 +599,7 @@ const landingHTML = `<!DOCTYPE html>
       localStorage.setItem('pocketbase_auth', JSON.stringify(auth));
     }
   } catch (e) {}
-  document.cookie = 'bzboot=1; path=__P__/';
+  document.cookie = 'bzboot2=1; path=__P__/';
   location.replace('__P__/');
 })();
 </script></body></html>`
@@ -690,23 +671,11 @@ func main() {
 		h.Del("Cross-Origin-Opener-Policy")
 		if prefix != "" {
 			// 同源网关模式: 浏览器看到的地址带 /app/beszel-aio 前缀,
-			// hub 的绝对路径跳转要补上前缀, 否则跳出应用路径
+			// hub 的绝对路径跳转要补上前缀, 否则跳出应用路径。
+			// 正文不做任何改写: 子路径适配由 hub 按 APP_URL 自己完成
+			// (官方姿势), 网关只剥前缀 + 补跳转前缀。
 			if loc := h.Get("Location"); strings.HasPrefix(loc, "/") && !strings.HasPrefix(loc, "//") && !strings.HasPrefix(loc, prefix+"/") && loc != prefix {
 				h.Set("Location", prefix+loc)
-			}
-			ct := h.Get("Content-Type")
-			if h.Get("Content-Encoding") == "" && resp.ContentLength >= 0 && resp.ContentLength <= 16<<20 && rewritableType(ct) {
-				raw, err := io.ReadAll(resp.Body)
-				_ = resp.Body.Close()
-				if err == nil {
-					nb := rewriteBody(raw, ct)
-					resp.Body = io.NopCloser(bytes.NewReader(nb))
-					resp.ContentLength = int64(len(nb))
-					h.Set("Content-Length", strconv.Itoa(len(nb)))
-					h.Del("ETag")
-				} else {
-					resp.Body = io.NopCloser(bytes.NewReader(raw))
-				}
 			}
 		}
 		if csp := h.Get("Content-Security-Policy"); strings.Contains(csp, "frame-ancestors") {
@@ -755,7 +724,7 @@ func main() {
 		al := state.AutoLogin
 		stateMu.Unlock()
 		if al && r.URL.Path == "/" {
-			if _, err := r.Cookie("bzboot"); err != nil {
+			if _, err := r.Cookie("bzboot2"); err != nil {
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				_, _ = io.WriteString(w, strings.ReplaceAll(landingHTML, "__P__", prefix))
 				return
@@ -784,7 +753,8 @@ func main() {
 		// /app/beszel-aio 前缀转发进来, TLS 由飞牛桌面终结,
 		// 家里/外网/APP 远程都跟着桌面走, 不再依赖独立端口。
 		// 注意: 网关把完整路径原样转给应用, 前缀要应用自己剥
-		// (飞牛原生应用同款做法), 出方向再由正文改写补回。
+		// (飞牛原生应用同款做法); 子路径资源适配由 hub 按 APP_URL
+		// 官方机制自己完成, 网关不改写任何响应正文。
 		srv.Handler = stripAppPrefix(prefix, mux)
 		_ = os.Remove(sockPath)
 		ln, err := net.Listen("unix", sockPath)

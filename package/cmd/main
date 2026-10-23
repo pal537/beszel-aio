@@ -5,7 +5,7 @@ PID_FILE="${TRIM_PKGVAR}/app.pid"
 PORT=18092
 
 DATA_DIR="${TRIM_PKGVAR}"
-CMD="env BZ_DATA_DIR=${DATA_DIR} BZ_APP_DIR=${TRIM_APPDEST} BZ_PORT=${PORT} ${TRIM_APPDEST}/bin/beszel-gateway"
+CMD="env BZ_DATA_DIR=${DATA_DIR} BZ_APP_DIR=${TRIM_APPDEST} BZ_PORT=${PORT} BZ_SOCK=${TRIM_APPDEST}/app.sock BZ_PREFIX=/app/beszel-aio ${TRIM_APPDEST}/bin/beszel-gateway"
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> ${LOG_FILE}
@@ -42,8 +42,8 @@ start_process() {
     printf "%s" "$!" > ${PID_FILE}
     local i
     for i in $(seq 1 60); do
-        if (exec 3<>/dev/tcp/127.0.0.1/${PORT}) 2>/dev/null; then
-            log_msg "beszel-aio ready on port ${PORT}"
+        if [ -S "${TRIM_APPDEST}/app.sock" ]; then
+            log_msg "beszel-aio ready on socket ${TRIM_APPDEST}/app.sock"
             return 0
         fi
         if ! status; then
@@ -52,7 +52,7 @@ start_process() {
         fi
         sleep 1
     done
-    log_msg "port ${PORT} not ready in 60s"
+    log_msg "socket ${TRIM_APPDEST}/app.sock not ready in 60s"
     return 1
 }
 
